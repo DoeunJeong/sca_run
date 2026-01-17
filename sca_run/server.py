@@ -10,7 +10,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 
 from .config import AppConfig, load_config
 from .audio_chunker import PCMChunker
-from .qwen_client import infer_pcm16le_once, wav_bytes_to_pcm16le
+from .qwen_client import (
+    extract_audio_input_from_pcm16le,
+    infer_audio_input_once,
+    wav_bytes_to_pcm16le,
+)
 
 app = FastAPI(title="sca_run")
 
@@ -34,7 +38,10 @@ async def infer_wav(file: UploadFile = File(...), prompt: str = "Transcribe the 
     """
     wav = await file.read()
     pcm16le, sr, ch = wav_bytes_to_pcm16le(wav)
-    text = infer_pcm16le_once(CFG, pcm16le, prompt, sample_rate=sr, channels=ch)
+    # 1) Audio -> features (AudioInput)
+    audio_in = extract_audio_input_from_pcm16le(CFG, pcm16le, sample_rate=sr, channels=ch)
+    # 2) Features -> inference
+    text = infer_audio_input_once(CFG, audio_in, prompt)
     return {"text": text, "sample_rate": sr, "channels": ch}
 
 
@@ -48,9 +55,9 @@ async def ws_pcm16(websocket: WebSocket):
     - subsequent messages: binary PCM16LE frames
 
     Important design choice:
-    - Server does NOT package PCM into WAV. It forwards raw PCM16LE chunks to the
-      inference layer, which performs feature extraction (e.g., via
-      processor.feature_extractor).
+    - Server does NOT package PCM into WAV.
+    - Server computes **audio features** (via processor.feature_extractor) and
+      forwards those features to the inference step.
     """
 
     await websocket.accept()
@@ -121,13 +128,15 @@ async def ws_pcm16(websocket: WebSocket):
 
             for chunk in chunker.feed(data):
                 try:
-                    text = infer_pcm16le_once(
+                    # 1) Audio -> features (AudioInput)
+                    audio_in = extract_audio_input_from_pcm16le(
                         session_cfg,
                         chunk,
-                        prompt,
                         sample_rate=session_cfg.audio.sample_rate,
                         channels=session_cfg.audio.channels,
                     )
+                    # 2) Features -> inference
+                    text = infer_audio_input_once(session_cfg, audio_in, prompt)
                 except Exception as e:
                     await websocket.send_json({"error": str(e)})
                     continue

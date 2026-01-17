@@ -7,6 +7,7 @@ import wave
 from typing import Optional, Tuple
 
 from .config import AppConfig
+from .types import AudioInput
 
 
 def wav_bytes_to_pcm16le(wav_bytes: bytes) -> Tuple[bytes, int, int]:
@@ -111,6 +112,110 @@ def _load_transformers_backend(cfg: AppConfig):
         return _MODEL, _PROCESSOR
 
 
+def extract_audio_input_from_pcm16le(
+    cfg: AppConfig,
+    pcm16le: bytes,
+    *,
+    sample_rate: int,
+    channels: int = 1,
+    timestamp: float = 0.0,
+) -> AudioInput:
+    """CPU-side feature extraction: PCM16LE -> AudioInput(features).
+
+    This produces the mel-spectrogram-style features that Qwen3-Omni expects
+    (typically shaped [1, 128, T]).
+
+    Notes:
+    - This uses processor.feature_extractor if available.
+    - The returned tensor is kept on CPU; the caller (inference) can move it to
+      GPU if desired.
+    """
+    if cfg.qwen.backend.lower() != "transformers":
+        raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers'.")
+
+    _model, processor = _load_transformers_backend(cfg)
+
+    fe = getattr(processor, "feature_extractor", None)
+    if fe is None:
+        raise RuntimeError("processor.feature_extractor is not available; cannot precompute features")
+
+    # Convert PCM bytes to mono float waveform.
+    waveform = _pcm16le_to_float_mono(pcm16le, channels=channels)
+
+    # Heavy imports live here
+    import torch
+
+    fe_out = fe(waveform, sampling_rate=sample_rate, return_tensors="pt")
+    if not hasattr(fe_out, "input_features"):
+        raise RuntimeError("feature_extractor output missing input_features")
+
+    features: torch.Tensor = fe_out.input_features
+    return AudioInput(features=features.cpu(), timestamp=float(timestamp))
+
+
+def infer_audio_input_once(cfg: AppConfig, audio_in: AudioInput, user_text: str) -> str:
+    """Local inference: precomputed AudioInput(features) -> text.
+
+    Use this when the *caller* has already computed audio features and wants
+    to pass them into the inference layer.
+    """
+    if cfg.qwen.backend.lower() != "transformers":
+        raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers'.")
+
+    model, processor = _load_transformers_backend(cfg)
+
+    # Build a conversation with an audio placeholder so the chat template inserts the right tokens.
+    conversation = [
+        {"role": "system", "content": cfg.qwen.system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": "<features>"},
+                {"type": "text", "text": user_text},
+            ],
+        },
+    ]
+
+    # Heavy imports live here
+    import torch
+
+    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+
+    # Tokenize text only; attach precomputed audio features.
+    text_inputs = processor(text=text, return_tensors="pt", padding=True)
+    inputs = dict(text_inputs)
+    inputs["input_features"] = audio_in.features
+
+    # Move inputs to model device.
+    try:
+        device = next(model.parameters()).device
+    except Exception:
+        device = getattr(model, "device", None)
+
+    if device is not None and str(device) != "meta":
+        for k, v in list(inputs.items()):
+            if torch.is_tensor(v):
+                # Keep audio features as float32 unless you *know* the model supports fp16 here.
+                if k == "input_features":
+                    inputs[k] = v.to(device=device, dtype=torch.float32)
+                else:
+                    inputs[k] = v.to(device)
+
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=int(cfg.qwen.max_new_tokens))
+
+    # Decode only newly generated tokens when possible.
+    try:
+        input_len = inputs["input_ids"].shape[1]
+        gen = out[:, input_len:]
+        if gen.numel() == 0:
+            gen = out
+    except Exception:
+        gen = out
+
+    return processor.batch_decode(gen, skip_special_tokens=True)[0]
+
+
 def infer_pcm16le_once(
     cfg: AppConfig,
     pcm16le: bytes,
@@ -136,68 +241,15 @@ def infer_pcm16le_once(
     if cfg.qwen.backend.lower() != "transformers":
         raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers'.")
 
-    model, processor = _load_transformers_backend(cfg)
-
-    # Convert PCM bytes to mono float waveform.
-    waveform = _pcm16le_to_float_mono(pcm16le, channels=channels)
-
-    # Build a conversation with an audio placeholder so the chat template inserts the right tokens.
-    conversation = [
-        {"role": "system", "content": cfg.qwen.system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": "<pcm16le>"},
-                {"type": "text", "text": user_text},
-            ],
-        },
-    ]
-
-    # Heavy imports live here
-    import torch
-
-    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-
-    # Preferred path: explicit feature extraction (matches team approach).
-    inputs = None
-    fe = getattr(processor, "feature_extractor", None)
-    if fe is not None:
-        try:
-            fe_out = fe(waveform, sampling_rate=sample_rate, return_tensors="pt")
-            # Build text tokens separately, then attach input_features.
-            text_inputs = processor(text=text, return_tensors="pt", padding=True)
-            inputs = dict(text_inputs)
-            inputs["input_features"] = fe_out.input_features
-        except Exception:
-            inputs = None
-
-    # Fallback: let the processor handle audio internally.
-    if inputs is None:
-        try:
-            inputs = processor(text=text, audio=[waveform], return_tensors="pt", padding=True, sampling_rate=sample_rate)
-        except TypeError:
-            inputs = processor(text=text, audio=[waveform], return_tensors="pt", padding=True)
-
-    # Move inputs to model device when possible.
-    try:
-        if hasattr(inputs, "to") and getattr(model, "device", None) is not None and str(model.device) != "meta":
-            inputs = inputs.to(model.device)
-    except Exception:
-        pass
-
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=int(cfg.qwen.max_new_tokens))
-
-    # Decode only newly generated tokens when possible.
-    try:
-        input_len = inputs["input_ids"].shape[1]
-        gen = out[:, input_len:]
-        if gen.numel() == 0:
-            gen = out
-    except Exception:
-        gen = out
-
-    return processor.batch_decode(gen, skip_special_tokens=True)[0]
+    # Two-step path: precompute features, then run inference.
+    audio_in = extract_audio_input_from_pcm16le(
+        cfg,
+        pcm16le,
+        sample_rate=sample_rate,
+        channels=channels,
+        timestamp=timestamp,
+    )
+    return infer_audio_input_once(cfg, audio_in, user_text)
 
 
 def infer_wav_once(cfg: AppConfig, wav_bytes: bytes, user_text: str) -> str:
