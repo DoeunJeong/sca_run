@@ -1,43 +1,45 @@
-# sca_run
-
-```bash
 import torch
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Any
+from typing import Optional
 
+# =========================================================
+# 1. [Input] 외부(Client/Sender) -> 엔진
+# =========================================================
 @dataclass
-class OmniModelContext:
-    audio_encoder: Any  # Audio Feature Extractor
-    thinker: Any        # Text LLM
-    talker: Any         # Audio Generation Model
-    code2wav: Any       # Audio Decoder (Codec)
+class AudioInput:
+    """
+    사용자의 음성을 엔진에 투입할 때 사용하는 패킷
+    """
+    # 전처리된 Mel-Spectrogram Feature [1, 128, T]
+    features: torch.Tensor 
+    
+    # (선택) 디버깅용 타임스탬프 (Lag 측정용)
+    timestamp: float = 0.0
 
+# =========================================================
+# 2. [Internal] Thinker(뇌) -> Talker(입)
+# =========================================================
 @dataclass
-class ConversationState:
-    # Thinker(LLM)의 과거 기억 (Key-Value Cache)
-    past_key_values_thinker: Optional[List[torch.Tensor]] = None
+class ThoughtPacket:
+    """
+    Thinker가 생각을 마치고 Talker에게 넘겨주는 패킷
+    """
+    # Talker의 입력이 될 Hidden States [1, Seq, Dim]
+    hidden_states: torch.Tensor
     
-    # Talker(Audio Gen)의 과거 기억
-    past_key_values_talker: Optional[List[torch.Tensor]] = None
-    
-    # 현재까지 누적된 텍스트 토큰 히스토리 (System Prompt + 대화 내용)
-    text_history_ids: Optional[torch.Tensor] = None
+    # 예: "음...", "반갑", "습니다"
+    text_token_str: Optional[str] = None
 
+# =========================================================
+# 3. [Output] 엔진 -> 외부(Client/Receiver)
+# =========================================================
 @dataclass
-class InferenceStepInput:
-    # 방금 들어온 오디오의 전처리된 텐서 (없으면 None)
-    # Shape: [Batch, Channel, Time] 등 모델 규격에 맞춤
-    new_audio_features: Optional[torch.Tensor]
+class AudioOutput:
+    """
+    엔진이 생성한 최종 결과물 패킷
+    """
+    # 스피커로 재생할 PCM Audio Bytes (Int16)
+    audio_bytes: bytes
     
-    # 현재 대화 상태 (직전 스텝의 Output에서 받은 것)
-    state: ConversationState
-
-@dataclass
-class InferenceStepOutput:
-    # 스피커로 내보낼 Raw Audio Bytes (생성된 게 없으면 b'')
-    generated_audio_bytes: bytes
-    
-    # 갱신된 대화 상태 (다음 턴 입력으로 사용)
-    updated_state: ConversationState
-
-```
+    # (선택) 이 오디오가 어떤 텍스트에서 나왔는지 (자막용)
+    text_log: Optional[str] = None
