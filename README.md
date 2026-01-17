@@ -2,9 +2,7 @@ import torch
 from dataclasses import dataclass
 from typing import Optional
 
-# =========================================================
-# 1. [Input] 외부(Client/Sender) -> 엔진
-# =========================================================
+
 @dataclass
 class AudioInput:
     """
@@ -16,9 +14,6 @@ class AudioInput:
     # (선택) 디버깅용 타임스탬프 (Lag 측정용)
     timestamp: float = 0.0
 
-# =========================================================
-# 2. [Internal] Thinker(뇌) -> Talker(입)
-# =========================================================
 @dataclass
 class ThoughtPacket:
     """
@@ -30,9 +25,6 @@ class ThoughtPacket:
     # 예: "음...", "반갑", "습니다"
     text_token_str: Optional[str] = None
 
-# =========================================================
-# 3. [Output] 엔진 -> 외부(Client/Receiver)
-# =========================================================
 @dataclass
 class AudioOutput:
     """
