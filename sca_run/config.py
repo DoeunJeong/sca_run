@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import os
 
@@ -17,6 +17,10 @@ def _env(key: str, default):
 
 @dataclass
 class AudioConfig:
+    """Audio chunking parameters.
+
+    Team request: remove hardcoded "12.5Hz / 4 frames" and make it configurable.
+    """
 
     # Incoming PCM sample rate (Hz)
     sample_rate: int = 16000
@@ -77,8 +81,8 @@ class QwenConfig:
 
 @dataclass
 class AppConfig:
-    audio: AudioConfig = field(default_factory=AudioConfig)
-    qwen: QwenConfig = field(default_factory=QwenConfig)
+    audio: AudioConfig = AudioConfig()
+    qwen: QwenConfig = QwenConfig()
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:

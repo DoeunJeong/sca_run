@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-from dataclasses import replace
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-from .config import AppConfig, load_config
 from .audio_chunker import PCMChunker
+from .config import AppConfig, load_config
 from .qwen_client import (
     extract_audio_input_from_pcm16le,
     infer_audio_input_once,
@@ -23,13 +22,37 @@ _CFG_PATH = os.getenv("SCA_CONFIG")
 CFG: AppConfig = load_config(_CFG_PATH)
 
 
+# UI is served from sca_run/static/index.html
+from importlib import resources
+from pathlib import Path
+
+def _load_index_html() -> str:
+    """Load the minimal mic UI HTML from package data.
+
+    Kept in a separate file for readability.
+    """
+    try:
+        return resources.files("sca_run").joinpath("static", "index.html").read_text(encoding="utf-8")
+    except Exception:
+        # Fallback for editable/dev runs when package data isn't included
+        here = Path(__file__).resolve().parent
+        return (here / "static" / "index.html").read_text(encoding="utf-8")
+
+INDEX_HTML = _load_index_html()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML)
+
+
 @app.get("/health")
 def health() -> str:
     return "ok"
 
 
 @app.post("/infer_wav")
-async def infer_wav(file: UploadFile = File(...), prompt: str = "Transcribe the audio."):
+async def infer_wav(file: UploadFile = File(...)):
     """One-shot inference endpoint.
 
     This endpoint accepts a WAV file upload and runs inference.
@@ -38,117 +61,71 @@ async def infer_wav(file: UploadFile = File(...), prompt: str = "Transcribe the 
     """
     wav = await file.read()
     pcm16le, sr, ch = wav_bytes_to_pcm16le(wav)
+
     # 1) Audio -> features (AudioInput)
     audio_in = extract_audio_input_from_pcm16le(CFG, pcm16le, sample_rate=sr, channels=ch)
-    # 2) Features -> inference
-    text = infer_audio_input_once(CFG, audio_in, prompt)
+
+    # 2) Features -> inference (no extra prompt text)
+    text = infer_audio_input_once(CFG, audio_in, "")
     return {"text": text, "sample_rate": sr, "channels": ch}
 
 
 @app.websocket("/ws/pcm16")
 async def ws_pcm16(websocket: WebSocket):
-    """WebSocket streaming: client sends PCM16LE bytes; server returns text per chunk.
+    """WebSocket streaming: client sends PCM16LE bytes; server processes per chunk.
 
-    Protocol:
-    - optional first text message: JSON dict with overrides, e.g.
-      {"prompt": "...", "frames_per_chunk": 6}
-    - subsequent messages: binary PCM16LE frames
+    Client:
+    - send binary frames only (ArrayBuffer)
 
-    Important design choice:
-    - Server does NOT package PCM into WAV.
-    - Server computes **audio features** (via processor.feature_extractor) and
-      forwards those features to the inference step.
+    Server:
+    - accumulates bytes
+    - every (frames_per_chunk) frames, extracts features and runs inference
+
+    NOTE: No prompt / no runtime overrides.
     """
 
     await websocket.accept()
-    session_cfg = CFG
-    prompt = "Transcribe the audio."
 
+    session_cfg = CFG
     chunker = PCMChunker(chunk_bytes=session_cfg.audio.chunk_bytes)
+    chunks = 0
 
     try:
         while True:
             msg = await websocket.receive()
-            if msg.get("text"):
-                # Allow runtime overrides
-                try:
-                    obj = json.loads(msg["text"])
-                except Exception:
-                    await websocket.send_json({"error": "invalid JSON"})
-                    continue
 
-                if isinstance(obj, dict):
-                    if "prompt" in obj and isinstance(obj["prompt"], str):
-                        prompt = obj["prompt"]
-
-                    if "frames_per_chunk" in obj:
-                        try:
-                            fpc = int(obj["frames_per_chunk"])
-                            if fpc <= 0:
-                                raise ValueError
-                            session_cfg = AppConfig(
-                                audio=replace(session_cfg.audio, frames_per_chunk=fpc),
-                                qwen=session_cfg.qwen,
-                            )
-                            chunker = PCMChunker(chunk_bytes=session_cfg.audio.chunk_bytes)
-                            await websocket.send_json(
-                                {
-                                    "info": "updated frames_per_chunk",
-                                    "frames_per_chunk": fpc,
-                                    "chunk_ms": session_cfg.audio.chunk_ms,
-                                }
-                            )
-                        except Exception:
-                            await websocket.send_json({"error": "frames_per_chunk must be positive int"})
-
-                    if "frame_hz" in obj:
-                        try:
-                            fhz = float(obj["frame_hz"])
-                            if fhz <= 0:
-                                raise ValueError
-                            session_cfg = AppConfig(
-                                audio=replace(session_cfg.audio, frame_hz=fhz),
-                                qwen=session_cfg.qwen,
-                            )
-                            chunker = PCMChunker(chunk_bytes=session_cfg.audio.chunk_bytes)
-                            await websocket.send_json(
-                                {
-                                    "info": "updated frame_hz",
-                                    "frame_hz": fhz,
-                                    "chunk_ms": session_cfg.audio.chunk_ms,
-                                }
-                            )
-                        except Exception:
-                            await websocket.send_json({"error": "frame_hz must be positive number"})
-                continue
-
+            # Ignore any text frames.
             data = msg.get("bytes")
             if not data:
                 continue
 
             for chunk in chunker.feed(data):
+                chunks += 1
                 try:
-                    # 1) Audio -> features (AudioInput)
                     audio_in = extract_audio_input_from_pcm16le(
                         session_cfg,
                         chunk,
                         sample_rate=session_cfg.audio.sample_rate,
                         channels=session_cfg.audio.channels,
                     )
-                    # 2) Features -> inference
-                    text = infer_audio_input_once(session_cfg, audio_in, prompt)
-                except Exception as e:
-                    await websocket.send_json({"error": str(e)})
-                    continue
 
-                await websocket.send_json(
-                    {
-                        "text": text,
-                        "chunk_ms": session_cfg.audio.chunk_ms,
-                        "frames_per_chunk": session_cfg.audio.frames_per_chunk,
-                        "frame_hz": session_cfg.audio.frame_hz,
-                    }
-                )
+                    # Run inference (no prompt text). Keep a short preview for UI debug.
+                    text = infer_audio_input_once(session_cfg, audio_in, "")
+                    preview = (text or "").strip().replace("\n", " ")
+                    if len(preview) > 120:
+                        preview = preview[:120] + "..."
+
+                    await websocket.send_json(
+                        {
+                            "chunks": chunks,
+                            "chunk_ms": session_cfg.audio.chunk_ms,
+                            "frames_per_chunk": session_cfg.audio.frames_per_chunk,
+                            "frame_hz": session_cfg.audio.frame_hz,
+                            "text_preview": preview,
+                        }
+                    )
+                except Exception as e:
+                    await websocket.send_json({"error": str(e), "chunks": chunks})
 
     except WebSocketDisconnect:
         return

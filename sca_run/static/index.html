@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sca_run mic</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    button { padding: 10px 14px; margin-right: 10px; }
+    #status { margin-top: 12px; }
+    #log { margin-top: 12px; white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 8px; min-height: 120px; }
+    .small { font-size: 12px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <h3>sca_run</h3>
+  <div>
+    <button id="micBtn">Mic ON</button>
+    <button id="runBtn" disabled>Start Qwen</button>
+  </div>
+  <div id="status" class="small">Idle.</div>
+  <div id="log" class="small"></div>
+
+<script>
+(() => {
+  const micBtn = document.getElementById('micBtn');
+  const runBtn = document.getElementById('runBtn');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+
+  let audioCtx = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let processorNode = null;
+  let zeroGain = null;
+
+  let ws = null;
+  let sending = false;
+  let micOn = false;
+
+  // Server expects 16kHz mono PCM16LE by default (see config/default.toml)
+  const TARGET_SR = 16000;
+
+  function setStatus(s) { statusEl.textContent = s; }
+  function log(s) {
+    logEl.textContent = (logEl.textContent + s + "\n").slice(-4000);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function downsampleBuffer(buffer, inSampleRate, outSampleRate) {
+    if (outSampleRate === inSampleRate) return buffer;
+    if (outSampleRate > inSampleRate) throw new Error('outSampleRate must be <= inSampleRate');
+
+    const ratio = inSampleRate / outSampleRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0;
+      let count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        accum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = count > 0 ? (accum / count) : 0;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  }
+
+  function floatTo16BitPCM(floatBuf) {
+    const out = new Int16Array(floatBuf.length);
+    for (let i = 0; i < floatBuf.length; i++) {
+      let s = Math.max(-1, Math.min(1, floatBuf[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  async function startMic() {
+    if (micOn) return;
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      }
+    });
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+
+    // ScriptProcessor is deprecated but still widely supported and minimal for a prototype.
+    // bufferSize 4096 is a common tradeoff.
+    processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    // Avoid echo/feedback by routing through a zero gain node.
+    zeroGain = audioCtx.createGain();
+    zeroGain.gain.value = 0;
+
+    processorNode.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      const inSR = audioCtx.sampleRate;
+      const mono16k = downsampleBuffer(input, inSR, TARGET_SR);
+      const pcm16 = floatTo16BitPCM(mono16k);
+
+      if (sending && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(pcm16.buffer);
+      }
+    };
+
+    sourceNode.connect(processorNode);
+    processorNode.connect(zeroGain);
+    zeroGain.connect(audioCtx.destination);
+
+    micOn = true;
+    runBtn.disabled = false;
+    micBtn.textContent = 'Mic OFF';
+    setStatus(`Mic ON. Browser SR=${audioCtx.sampleRate} -> sending ${TARGET_SR}Hz mono PCM16 when Qwen starts.`);
+  }
+
+  async function stopMic() {
+    if (!micOn) return;
+
+    try { processorNode && processorNode.disconnect(); } catch (e) {}
+    try { sourceNode && sourceNode.disconnect(); } catch (e) {}
+    try { zeroGain && zeroGain.disconnect(); } catch (e) {}
+
+    if (mediaStream) {
+      for (const t of mediaStream.getTracks()) t.stop();
+    }
+
+    if (audioCtx) {
+      try { await audioCtx.close(); } catch (e) {}
+    }
+
+    audioCtx = null;
+    mediaStream = null;
+    sourceNode = null;
+    processorNode = null;
+    zeroGain = null;
+
+    micOn = false;
+    micBtn.textContent = 'Mic ON';
+    runBtn.disabled = true;
+    setStatus('Mic OFF.');
+  }
+
+  function wsUrl() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${proto}://${location.host}/ws/pcm16`;
+  }
+
+  function startQwen() {
+    if (sending) return;
+    if (!micOn) {
+      log('Turn mic on first.');
+      return;
+    }
+
+    ws = new WebSocket(wsUrl());
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      sending = true;
+      runBtn.textContent = 'Stop Qwen';
+      setStatus('Streaming audio to server... (server will chunk into 4 frames per request)');
+      log('WS connected: ' + wsUrl());
+    };
+
+    ws.onmessage = (ev) => {
+      // Server replies JSON per processed chunk.
+      try {
+        const obj = JSON.parse(ev.data);
+        if (obj && typeof obj === 'object') {
+          if (obj.error) {
+            log('ERROR: ' + obj.error);
+          } else {
+            // Keep it minimal: show chunk counter and optional text preview
+            let line = `chunk #${obj.chunks ?? '?'} processed`;
+            if (obj.text_preview) line += ` | text: ${obj.text_preview}`;
+            log(line);
+          }
+        } else {
+          log(String(ev.data));
+        }
+      } catch {
+        log(String(ev.data));
+      }
+    };
+
+    ws.onclose = () => {
+      sending = false;
+      runBtn.textContent = 'Start Qwen';
+      setStatus(micOn ? 'Mic ON. Qwen stopped.' : 'Idle.');
+      log('WS closed.');
+    };
+
+    ws.onerror = () => {
+      log('WS error.');
+    };
+  }
+
+  function stopQwen() {
+    if (!ws) return;
+    try { ws.close(); } catch (e) {}
+    ws = null;
+    sending = false;
+    runBtn.textContent = 'Start Qwen';
+  }
+
+  micBtn.addEventListener('click', async () => {
+    try {
+      if (!micOn) await startMic();
+      else await stopMic();
+    } catch (e) {
+      log('Mic error: ' + (e && e.message ? e.message : String(e)));
+      setStatus('Mic error.');
+    }
+  });
+
+  runBtn.addEventListener('click', () => {
+    if (!sending) startQwen();
+    else stopQwen();
+  });
+})();
+</script>
+</body>
+</html>
