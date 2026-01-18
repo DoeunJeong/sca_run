@@ -7,7 +7,7 @@ import wave
 from typing import Optional, Tuple
 
 from .config import AppConfig
-from .types import AudioInput
+from .io_types import AudioInput
 
 
 def wav_bytes_to_pcm16le(wav_bytes: bytes) -> Tuple[bytes, int, int]:
