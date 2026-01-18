@@ -57,7 +57,7 @@ async def sender_loop(engine, chunks, processor, model, device):
         
         # 전처리 (Blocking이지만 짧음)
         features = processor.feature_extractor(
-            [chunk], return_tensors="pt", sampling_rate=16000
+            [chunk], return_tensors="pt", sampling_rate=16000,padding=False,
         )
         input_features = features.input_features.to(device).to(model.dtype)
         
@@ -114,7 +114,7 @@ async def main_async():
     log("info", f"Loading Model from {args.model_path}...")
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         args.model_path,
-        device_map=device_map, 
+        device_map="auto", 
         torch_dtype=torch.bfloat16, # BF16 원본 로드 (양자화 X)
         attn_implementation='flash_attention_2',
         trust_remote_code=True

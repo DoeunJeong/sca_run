@@ -397,6 +397,7 @@ class Qwen3OmniFullDuplexEngine:
             
             def run_thinker_inference():
                 with torch.no_grad():
+                    log("debug", f"🔊 Thinker processing audio features: shape={audio_features.shape}")
                     # =========================================================
                     # [Step 1] 듣기 (Listening)
                     # =========================================================
