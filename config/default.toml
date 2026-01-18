@@ -1,0 +1,32 @@
+[audio]
+# Incoming audio sample rate. If your client sends 48kHz Opus-decoded PCM, set this to 48000.
+sample_rate = 16000
+
+# Framing reference (12.5Hz => 80ms per frame)
+frame_hz = 12.5
+
+# How many frames to batch into one model request
+frames_per_chunk = 4
+
+[qwen]
+# Backend: "transformers" (local HF inference)
+backend = "transformers"
+
+# Hugging Face model id or local path
+model_id = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+# Common Transformers knobs
+# device_map: "auto" to spread across available GPUs; or "cuda:0" for single GPU
+device_map = "auto"
+
+# torch_dtype: "auto", "float16", "bfloat16", "float32"
+torch_dtype = "auto"
+
+# Optional: "flash_attention_2" if installed; or "eager" / leave empty
+attn_implementation = "flash_attention_2"
+
+# Generation length for each request
+max_new_tokens = 256
+
+# Optional system prompt
+system_prompt = "You are a helpful assistant."

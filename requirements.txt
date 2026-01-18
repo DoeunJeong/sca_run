@@ -1,18 +1,11 @@
-# --- Deep Learning Core ---
-torch>=2.4.0
-numpy
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
 
-# --- Hugging Face & Model ---
-transformers>=4.46.0
-accelerate>=1.0.0       # device_map="auto" 사용 시 필수
+# Local Qwen3-Omni inference (Transformers)
+# NOTE: Install an appropriate PyTorch build for your environment separately.
+transformers==4.57.3
+accelerate>=0.26
 
-# --- Audio Processing ---
-librosa>=0.10.0         # 오디오 로드 및 리샘플링
-soundfile>=0.12.0       # 오디오 저장 (sf.write)
-scipy                   # librosa 의존성
-
-# --- Optimization (코드에 flash_attention_2가 명시되어 있음) ---
-flash-attn>=2.6.3
-
-#apt-get install -y libsndfile1 ffmpeg build-essential ninja-build
-
+# Optional but recommended for speed (GPU only):
+# flash-attn

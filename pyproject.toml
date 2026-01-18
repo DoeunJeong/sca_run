@@ -1,0 +1,16 @@
+[project]
+name = "sca_run"
+version = "0.1.1"
+description = "Config-driven scaffold for streaming audio to Qwen3-Omni (Transformers backend)"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  "python-multipart>=0.0.9",
+  "transformers==4.57.3",
+  "accelerate>=0.26",
+  "qwen-omni-utils",
+]
+
+[tool.setuptools]
+packages = ["sca_run"]
