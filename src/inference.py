@@ -137,10 +137,26 @@ class Qwen3DuplexLogic:
 
         # =========================================================================
         
-        # Position IDs 생성
         seq_len = input_ids.shape[1]
-        position_ids = torch.arange(step_idx, step_idx + seq_len, device=self.thinker_device)
-        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        
+        # 1. Config에서 최대 길이 가져오기 (없으면 1500 기본값)
+        # 오디오 인코더의 한계(1500)가 전체 문맥 길이보다 타이트하므로 이를 기준으로 잡음
+        max_pos_limit = getattr(self.model.config.thinker_config.audio_config, "max_source_positions", 1500)
+        
+        # 2. Cycling 로직 적용 (안전 구간: max_pos_limit의 50% 지점부터 순환)
+        # 예: 1500이면 750 ~ 1500 사이를 뱅글뱅글 돎
+        cycle_start = max_pos_limit // 2  # 750
+        cycle_len = max_pos_limit - cycle_start # 750
+        
+        if step_idx >= max_pos_limit:
+            safe_start_idx = cycle_start + (step_idx - cycle_start) % cycle_len
+        else:
+            safe_start_idx = step_idx
+            
+        current_pos_ids = torch.arange(safe_start_idx, safe_start_idx + seq_len, device=target_device)
+        current_pos_ids = current_pos_ids.clamp(0, max_pos_limit - 1)
+        position_ids = current_pos_ids.unsqueeze(0).expand(3, -1, -1)
+
 
         outputs = self.model.thinker(
             input_ids=input_ids,
@@ -266,10 +282,8 @@ class Qwen3DuplexLogic:
             # 2. Projection (가장 많이 멈추는 구간)
             #    여기서 멈추지 않게 타임아웃을 걸 수는 없으니, 에러가 나면 더미로 대체하는 구조는 아니지만,
             #    최소한 확실하게 실행되도록 구성
-            log("debug", "👉 [Talker] Executing Projection...")
             conditioned_hidden = self.model.talker.text_projection(thinker_hidden)
-            log("debug", "✅ [Talker] Projection Done.")
-
+            
             # 3. Main Forward
             if input_ids is None:
                  input_ids = torch.tensor([[self.model.config.talker_config.codec_bos_id]], device=self.talker_device)
@@ -279,17 +293,32 @@ class Qwen3DuplexLogic:
             audio_embed = self.model.talker.model.get_input_embeddings()(input_ids)
             talker_inputs_embeds = audio_embed + conditioned_hidden
             
-            position_ids = torch.tensor([[step_idx]], device=self.talker_device)
+            max_pos_limit = getattr(self.model.config.talker_config.text_config, "max_position_embeddings", 2048)
+            
+            # Talker는 오디오 인코더 제약이 없어서 좀 더 길 수 있지만, 
+            # 안전하게 1500~2000 사이 적당한 값으로 순환 (Thinker와 비슷하게 맞추는 게 좋음)
+            if max_pos_limit > 1500: max_pos_limit = 1500 # 보수적 설정
+            
+            cycle_start = max_pos_limit // 2
+            cycle_len = max_pos_limit - cycle_start
+            
+            if step_idx >= max_pos_limit:
+                safe_step_idx = cycle_start + (step_idx - cycle_start) % cycle_len
+            else:
+                safe_step_idx = step_idx
+                
+            if safe_step_idx >= max_pos_limit:
+                safe_step_idx = max_pos_limit - 1
+                
+            position_ids = torch.tensor([[safe_step_idx]], device=target_device)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-            log("debug", "👉 [Talker] Executing Main Model...")
             talker_out = self.model.talker.model(
                 inputs_embeds=talker_inputs_embeds,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
                 use_cache=True
             )
-            log("debug", "✅ [Talker] Main Model Done.")
 
             # 4. Code Prediction (Manual Loop)
             #    여기가 너무 느리거나 멈추면 바로 Skip하기 위해 try-except 블록 강화
@@ -307,24 +336,25 @@ class Qwen3DuplexLogic:
             predictor_codes = [layer0_code]
             predictor_kv = None 
             
-            log("debug", "👉 [Talker] Executing Code Predictor Loop...")
             for i in range(self.num_quantizers - 1):
-                # 루프가 너무 빠르면 로그 생략, 디버깅 땐 켜기
-                # log("debug", f"   - Layer {i+1}") 
+                # Predictor Forward
                 pred_out = self.model.talker.code_predictor.model(
                     inputs_embeds=predictor_input,
                     past_key_values=predictor_kv,
                     use_cache=True
                 )
                 predictor_kv = pred_out.past_key_values
-                curr_logits = self.model.talker.lm_head[i](pred_out.last_hidden_state[:, -1, :])
+                
+                # ★★★ [수정된 부분] 주소 변경: talker.lm_head -> talker.code_predictor.lm_head ★★★
+                # Qwen3 구조상 Residual Layer 예측 헤드는 code_predictor 안에 있습니다.
+                curr_logits = self.model.talker.code_predictor.lm_head[i](pred_out.last_hidden_state[:, -1, :])
+                
                 next_code = curr_logits.argmax(dim=-1, keepdim=True)
                 predictor_codes.append(next_code)
+                
+                # 다음 입력 임베딩
                 predictor_input = self.model.talker.code_predictor.get_input_embeddings()[i](next_code)
             
-            log("debug", "✅ [Talker] Predictor Loop Done.")
-            # --- [BYPASS END] ---
-
             full_audio_codes = torch.cat(predictor_codes, dim=1)
             return full_audio_codes, talker_out.past_key_values
 
@@ -413,7 +443,6 @@ class Qwen3OmniFullDuplexEngine:
         log("info", "Engine Ready.")
         
     async def _thinker_loop(self):
-        log("info", "Thinker Loop Started")
         loop = asyncio.get_running_loop()
         
         while self.is_running:
@@ -421,7 +450,6 @@ class Qwen3OmniFullDuplexEngine:
             
             def run_thinker_inference():
                 with torch.no_grad():
-                    log("debug", f"🔊 Thinker processing audio features: shape={audio_features.shape}")
                     # =========================================================
                     # [Step 1] 듣기 (Listening)
                     # =========================================================
@@ -475,7 +503,7 @@ class Qwen3OmniFullDuplexEngine:
                         # 3. ★ 중요: 텍스트 입력에 대한 결과(Hidden State)만 저장
                         #    이것이 공식 코드의 assistant_hidden 부분과 일치함
                         safe_hidden = thinker_out.hidden_states[-1].detach().clone()
-                        log("debug", f"Appending thinker hidden state for text token: shape={safe_hidden.shape}")
+
 
                         current_turn_hiddens.append(safe_hidden)
                         
@@ -515,14 +543,12 @@ class Qwen3OmniFullDuplexEngine:
                     ratio = self.cfg.audio_output_tokens // self.cfg.text_output_tokens
                     output_chunks = []
 
-                    log("info", f"👄 Talker generating audio...{num_hiddens} hidden states, ratio {ratio}")
             
 
                     for i in range(num_hiddens):
                         one_hidden = source_hidden[:, i:i+1, :]
                         for _ in range(ratio):
-                            log("debug", f"Talker generating token at step {self.talker_step_count}")
-
+            
                             codes, new_kv = self.logic.talker_step(
                                 thinker_hidden=one_hidden,
                                 past_key_values=self.talker_kv_cache,
