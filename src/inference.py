@@ -321,6 +321,14 @@ class Qwen3OmniFullDuplexEngine:
                         current_turn_hiddens = []
                         token_str = ""
                         
+
+                        
+                        #if model predicts silence, return None / No excute talker
+                        if token_id == self.cfg.silence_token_id:
+                          return None, "<|silence|>"
+
+
+
                         for _ in range(self.cfg.text_output_tokens):
                             # Text Generation
                             thinker_out = self.logic.thinker_step(
