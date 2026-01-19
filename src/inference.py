@@ -35,13 +35,30 @@ class EngineConfig:
 # =============================================================================
 # 2. 로직 클래스 (Stateless Tensor Operations)
 # =============================================================================
+
 class Qwen3DuplexLogic:
     def __init__(self, model):
         self.model = model
-        self.device = model.device
-        self.thinker_device = model.thinker.device
-        self.talker_device = model.talker.device
-        self.code2wav_device = model.code2wav.device
+        self.device = model.device # 대표 디바이스 (보통 cuda:0)
+        
+        # [수정] 각 모듈의 실제 디바이스 위치를 파악하여 저장
+        # 모델이 분산되어 있을 경우 thinker_device와 talker_device가 다름
+        if hasattr(model, "thinker"):
+            self.thinker_device = model.thinker.device
+        else:
+            self.thinker_device = self.device
+
+        if hasattr(model, "talker"):
+            # Talker의 첫 번째 파라미터 위치를 기준으로 잡음
+            self.talker_device = next(model.talker.parameters()).device
+        else:
+            self.talker_device = self.device
+            
+        if hasattr(model, "code2wav"):
+            self.code2wav_device = next(model.code2wav.parameters()).device
+        else:
+            self.code2wav_device = self.device
+
         self.talker_config = model.config.talker_config
         self.num_quantizers = getattr(self.talker_config, "num_quantizers", 16)
         
@@ -73,8 +90,10 @@ class Qwen3DuplexLogic:
     @torch.no_grad()
     def thinker_step(self, input_ids, input_features, feature_attention_mask, past_key_values, step_idx):
         # [Safety] Device Move
-        if input_ids is not None and input_ids.device != self.thinker_device:
-            input_ids = input_ids.to(self.thinker_device)
+        target_device = self.thinker_device
+        
+        if input_ids is not None and input_ids.device != target_device:
+            input_ids = input_ids.to(target_device)
         
         # =========================================================================
         # ★ [최종 수정] Audio Input 처리 (공식 아키텍처 준수)
@@ -236,9 +255,11 @@ class Qwen3DuplexLogic:
     @torch.no_grad()
     def talker_step(self, thinker_hidden, past_key_values, step_idx, input_ids=None):
         try:
+            target_device = self.talker_device
+            
             # 1. Device & Memory Safety Check
-            if thinker_hidden.device != self.talker_device:
-                thinker_hidden = thinker_hidden.to(self.talker_device)
+            if thinker_hidden.device != target_device:
+                thinker_hidden = thinker_hidden.to(target_device)
             if not thinker_hidden.is_contiguous():
                 thinker_hidden = thinker_hidden.contiguous()
 
@@ -319,13 +340,16 @@ class Qwen3DuplexLogic:
 
     @torch.no_grad()
     def decode_audio(self, audio_codes: torch.Tensor) -> np.ndarray:
-        if audio_codes.device != self.code2wav_device:
-            audio_codes = audio_codes.to(self.code2wav_device)
+        # [Device Alignment] Code2Wav가 있는 곳으로 이동
+        target_device = self.code2wav_device
+        
+        if audio_codes.device != target_device:
+            audio_codes = audio_codes.to(target_device)
+            
         if audio_codes.dim() == 2:
             audio_codes = audio_codes.unsqueeze(-1)
             
         wav_tensor = self.model.code2wav(audio_codes)
-        # Non-blocking transfer
         wav_cpu = wav_tensor.to("cpu", non_blocking=True).float().numpy()
         return wav_cpu
 
@@ -484,9 +508,6 @@ class Qwen3OmniFullDuplexEngine:
         while self.is_running:
             # 큐에서 데이터를 꺼낼 때까지 대기
             source_hidden = await self.hidden_queue.get()
-            
-            # ★ [요청하신 수정] Talker가 실제로 일을 시작할 때 로그 출력
-            # (Queue에서 꺼냈다는 건 침묵이 아니라는 뜻)
             
             def run_talker_inference():
                 with torch.no_grad():

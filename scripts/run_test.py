@@ -84,39 +84,32 @@ async def main_async():
     args = parser.parse_args()
 
 
-    device_map = {
-        # --- [GPU 0] Thinker Input & Front Layers ---
-        "thinker.audio_tower": 0,
-        "thinker.visual": 0,
-        "thinker.model.embed_tokens": 0,
-        "thinker.model.rotary_emb": 0, # 위치 정보는 0번에서 시작
-        
-        # --- [GPU 1] Thinker Output & Talker System ---
-        "thinker.model.norm": 1,
-        "thinker.lm_head": 1,
-        "talker": 1,    # Talker 전체 (Model, Projection, Predictor 등)
-        "code2wav": 1,  # Audio Decoder
-    }
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_compute_dtype=torch.bfloat16,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4"
+    # )
 
-    # Thinker Layer 분산 (총 48개 레이어)
-    # 0~27번 (28개) -> GPU 0 (약 35GB 소모 예상)
-    # 28~47번 (20개) -> GPU 1 (Talker 포함 약 30GB 소모 예상)
-    # -> 남는 VRAM은 KV Cache가 사용함
-    num_thinker_layers = 48
-    split_index = 28
-    for i in range(num_thinker_layers):
-        if i < split_index:
-            device_map[f"thinker.model.layers.{i}"] = 0
-        else:
-            device_map[f"thinker.model.layers.{i}"] = 1
+    # 2. 깔끔한 Device Map (레이어 쪼개기 금지)
+    # - Thinker 전체를 GPU 0에 할당 (약 20GB 소모)
+    # - Talker/Audio 전체를 GPU 1에 할당 (약 5GB 소모)
+    # -> 서로 간섭 없이 독립적으로 돌아가므로 에러가 날 수 없음
+    device_map = {
+        "thinker": 0,
+        "talker": 1,
+        "code2wav": 1
+    }
 
 
     log("info", f"Loading Model from {args.model_path}...")
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         args.model_path,
         device_map="auto", 
+        #quantization_config=bnb_config,
         torch_dtype=torch.bfloat16, # BF16 원본 로드 (양자화 X)
-        attn_implementation='flash_attention_2',
+        #attn_implementation='flash_attention_2',
+        attn_implementation='sdpa',
         trust_remote_code=True
     )
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.model_path, trust_remote_code=True)
@@ -153,7 +146,7 @@ async def main_async():
         await sender_loop(engine, chunks, processor, model, args.device)
         
         log("info", "All chunks sent. Waiting for trailing response...")
-        await asyncio.sleep(120.0) # 잔여 응답 대기
+        await asyncio.sleep(60.0) # 잔여 응답 대기
 
     except asyncio.CancelledError:
         pass
