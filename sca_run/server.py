@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Optional
 
+import numpy as np
+
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 
 from .audio_chunker import PCMChunker
 from .config import AppConfig, load_config
 from .qwen_client import (
     extract_audio_input_from_pcm16le,
-    infer_audio_input_once,
     wav_bytes_to_pcm16le,
 )
+
+# New: best-effort text+audio result
+from .qwen_client import infer_audio_input_once_result
 
 app = FastAPI(title="sca_run")
 
@@ -46,6 +52,39 @@ def index() -> HTMLResponse:
     return HTMLResponse(INDEX_HTML)
 
 
+@app.get("/favicon.ico")
+def favicon():
+    # Browsers request this automatically; returning an empty response avoids noisy 404s.
+    return Response(status_code=204)
+
+
+def _wav_np_to_mono_f32(wav: np.ndarray) -> np.ndarray:
+    """Normalize various wav array shapes to mono float32 [T]."""
+    w = wav
+    if w is None:
+        return np.zeros((0,), dtype=np.float32)
+
+    # Common shapes: [T], [1,T], [B,T], [B,T,1], [B,T,C]
+    if w.ndim == 3:
+        # [B, T, C] -> first batch, first channel
+        w = w[0, :, 0]
+    elif w.ndim == 2:
+        # [B, T] -> first batch
+        w = w[0]
+
+    w = np.asarray(w, dtype=np.float32).reshape(-1)
+    return w
+
+
+def _f32_to_pcm16le_bytes(w: np.ndarray) -> bytes:
+    """Convert float32 waveform in [-1,1] to PCM16LE bytes."""
+    if w.size == 0:
+        return b""
+    w = np.clip(w, -1.0, 1.0)
+    pcm = (w * 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
 @app.get("/health")
 def health() -> str:
     return "ok"
@@ -66,8 +105,13 @@ async def infer_wav(file: UploadFile = File(...)):
     audio_in = extract_audio_input_from_pcm16le(CFG, pcm16le, sample_rate=sr, channels=ch)
 
     # 2) Features -> inference (no extra prompt text)
-    text = infer_audio_input_once(CFG, audio_in, "")
-    return {"text": text, "sample_rate": sr, "channels": ch}
+    result = infer_audio_input_once_result(CFG, audio_in, "")
+    return {
+        "text": result.get("text", ""),
+        "sample_rate": sr,
+        "channels": ch,
+        "has_audio": bool(result.get("wav_f32") is not None),
+    }
 
 
 @app.websocket("/ws/pcm16")
@@ -110,22 +154,50 @@ async def ws_pcm16(websocket: WebSocket):
                     )
 
                     # Run inference (no prompt text). Keep a short preview for UI debug.
-                    text = infer_audio_input_once(session_cfg, audio_in, "")
-                    preview = (text or "").strip().replace("\n", " ")
+                    res = infer_audio_input_once_result(session_cfg, audio_in, "")
+                    text = (res.get("text") or "").strip()
+                    preview = text.replace("\n", " ")
                     if len(preview) > 120:
                         preview = preview[:120] + "..."
 
-                    await websocket.send_json(
-                        {
-                            "chunks": chunks,
-                            "chunk_ms": session_cfg.audio.chunk_ms,
-                            "frames_per_chunk": session_cfg.audio.frames_per_chunk,
-                            "frame_hz": session_cfg.audio.frame_hz,
-                            "text_preview": preview,
-                        }
+                    # 1) Always send a chunk status message
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "chunk_result",
+                                "chunks": chunks,
+                                "chunk_ms": session_cfg.audio.chunk_ms,
+                                "frames_per_chunk": session_cfg.audio.frames_per_chunk,
+                                "frame_hz": session_cfg.audio.frame_hz,
+                                "text_preview": preview,
+                            }
+                        )
                     )
+
+                    # 2) If text exists, send it as a separate event for the UI log
+                    if text:
+                        await websocket.send_text(json.dumps({"type": "talker_text", "text": text}))
+
+                    # 3) If the model returned audio, stream it as:
+                    #    JSON meta (talker_audio) -> binary PCM16LE bytes
+                    wav = res.get("wav_f32")
+                    sr = res.get("sr") or 24000
+                    if wav is not None:
+                        mono = _wav_np_to_mono_f32(wav)
+                        pcm_bytes = _f32_to_pcm16le_bytes(mono)
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "talker_audio",
+                                    "sr": int(sr),
+                                    "fmt": "pcm16le",
+                                    "channels": 1,
+                                }
+                            )
+                        )
+                        await websocket.send_bytes(pcm_bytes)
                 except Exception as e:
-                    await websocket.send_json({"error": str(e), "chunks": chunks})
+                    await websocket.send_text(json.dumps({"type": "error", "error": str(e), "chunks": chunks}))
 
     except WebSocketDisconnect:
         return

@@ -4,10 +4,10 @@ import array
 import io
 import threading
 import wave
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, Callable
 
 from .config import AppConfig
-from .types import AudioInput
+from .io_types import AudioInput
 
 
 def wav_bytes_to_pcm16le(wav_bytes: bytes) -> Tuple[bytes, int, int]:
@@ -130,8 +130,13 @@ def extract_audio_input_from_pcm16le(
     - The returned tensor is kept on CPU; the caller (inference) can move it to
       GPU if desired.
     """
-    if cfg.qwen.backend.lower() != "transformers":
-        raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers'.")
+    # Feature extraction is needed for both:
+    # - backend="transformers" (end-to-end)
+    # - backend="team" (teammate pipeline still needs the same features)
+    if cfg.qwen.backend.lower() not in ("transformers", "team"):
+        raise ValueError(
+            f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers' or 'team'."
+        )
 
     _model, processor = _load_transformers_backend(cfg)
 
@@ -153,18 +158,173 @@ def extract_audio_input_from_pcm16le(
     return AudioInput(features=features.cpu(), timestamp=float(timestamp))
 
 
-def infer_audio_input_once(cfg: AppConfig, audio_in: AudioInput, user_text: str) -> str:
-    """Local inference: precomputed AudioInput(features) -> text.
+def _extract_sequences_and_audio(generate_out: Any):
+    """Best-effort extraction of (sequences, audio_tensor) from model.generate output.
 
-    Use this when the *caller* has already computed audio features and wants
-    to pass them into the inference layer.
+    Qwen3-Omni may return:
+    - a Tensor of token ids
+    - a tuple (token_ids, audio)
+    - a GenerateOutput-like object with .sequences and maybe .audio/.audios
     """
-    if cfg.qwen.backend.lower() != "transformers":
-        raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers'.")
+    seq = None
+    audio = None
+
+    # Tuple style: (text_ids, audio)
+    if isinstance(generate_out, tuple) and len(generate_out) >= 1:
+        seq = generate_out[0]
+        if len(generate_out) >= 2:
+            audio = generate_out[1]
+        return seq, audio
+
+    # GenerateOutput style
+    if hasattr(generate_out, "sequences"):
+        seq = getattr(generate_out, "sequences")
+        for k in (
+            "audio",
+            "audios",
+            "audio_values",
+            "audio_waveform",
+            "waveform",
+            # Some implementations return codec/codes rather than waveform
+            "audio_codes",
+            "codec_codes",
+            "codes",
+        ):
+            if hasattr(generate_out, k):
+                audio = getattr(generate_out, k)
+                break
+        return seq, audio
+
+    # Dict style
+    if isinstance(generate_out, dict):
+        seq = generate_out.get("sequences") or generate_out.get("sequence") or generate_out.get("ids")
+        for k in (
+            "audio",
+            "audios",
+            "audio_values",
+            "audio_waveform",
+            "waveform",
+            "audio_codes",
+            "codec_codes",
+            "codes",
+        ):
+            if k in generate_out:
+                audio = generate_out[k]
+                break
+        return seq, audio
+
+    # Plain tensor
+    return generate_out, None
+
+
+def _find_code2wav(model: Any) -> Optional[Callable[[Any], Any]]:
+    """Find a `code2wav` callable on common Qwen3-Omni model layouts."""
+    candidates = []
+    for obj in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "talker", None),
+        getattr(getattr(model, "talker", None), "model", None),
+    ):
+        if obj is None:
+            continue
+        fn = getattr(obj, "code2wav", None)
+        if callable(fn):
+            candidates.append(fn)
+    return candidates[0] if candidates else None
+
+
+def _maybe_decode_codec_to_wav(cfg: AppConfig, model: Any, audio_obj: Any):
+    """Best-effort: if `audio_obj` looks like RVQ codec codes, decode via code2wav.
+
+    Returns:
+        (wav_tensor_or_ndarray, did_decode: bool)
+    """
+    import torch
+
+    if audio_obj is None:
+        return None, False
+
+    # Only attempt if it is a Tensor and looks *discrete*.
+    if not torch.is_tensor(audio_obj):
+        return None, False
+
+    # Heuristic: discrete dtypes, or integer-like values.
+    is_discrete = audio_obj.dtype in (
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.long,
+    )
+    if not is_discrete:
+        # If float but values are large integers, treat as codes.
+        try:
+            if audio_obj.numel() > 0:
+                mx = float(audio_obj.detach().abs().max().item())
+                is_discrete = mx > 2.0
+        except Exception:
+            is_discrete = False
+
+    if not is_discrete:
+        return None, False
+
+    code2wav = _find_code2wav(model)
+    if code2wav is None:
+        return None, False
+
+    codes = audio_obj
+    # Teammate's decoder expects an extra trailing dim sometimes.
+    if codes.dim() == 2:
+        codes = codes.unsqueeze(-1)
+
+    try:
+        wav = code2wav(codes)
+        return wav, True
+    except Exception:
+        return None, False
+
+
+def _wav_to_numpy_f32(wav_obj: Any):
+    """Convert a torch tensor / ndarray into numpy float32."""
+    import numpy as np
+    import torch
+
+    if wav_obj is None:
+        return None
+    if torch.is_tensor(wav_obj):
+        return wav_obj.to("cpu").float().numpy()
+    return np.asarray(wav_obj, dtype=np.float32)
+
+
+def infer_audio_input_once_result(cfg: AppConfig, audio_in: AudioInput, user_text: str = "") -> dict:
+    """Local inference: precomputed AudioInput(features) -> result dict.
+
+    Returns:
+        {
+          "text": str,
+          "wav_f32": Optional[np.ndarray],  # mono float32 waveform in [-1,1]
+          "sr": Optional[int],              # sample rate for wav_f32
+        }
+
+    Notes:
+    - Audio output is best-effort; depending on the model/transformers version,
+      generate() may or may not return audio.
+    """
+    backend = cfg.qwen.backend.lower()
+    if backend == "team":
+        # Teammate-owned inference pipeline. This keeps the server/UI stable while
+        # your teammate iterates on model internals.
+        from . import team_infer
+
+        return team_infer.infer_audio_input_once_result(cfg, audio_in, user_text=user_text)
+
+    if backend != "transformers":
+        raise ValueError(f"Unsupported backend: {cfg.qwen.backend!r}. Expected 'transformers' or 'team'.")
 
     model, processor = _load_transformers_backend(cfg)
 
-    # Build a conversation with an audio placeholder so the chat template inserts the right tokens.
     conversation = [
         {"role": "system", "content": cfg.qwen.system_prompt},
         {
@@ -176,13 +336,11 @@ def infer_audio_input_once(cfg: AppConfig, audio_in: AudioInput, user_text: str)
         },
     ]
 
-    # Heavy imports live here
     import torch
 
-    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    text_inputs = processor(text=text_prompt, return_tensors="pt", padding=True)
 
-    # Tokenize text only; attach precomputed audio features.
-    text_inputs = processor(text=text, return_tensors="pt", padding=True)
     inputs = dict(text_inputs)
     inputs["input_features"] = audio_in.features
 
@@ -195,25 +353,73 @@ def infer_audio_input_once(cfg: AppConfig, audio_in: AudioInput, user_text: str)
     if device is not None and str(device) != "meta":
         for k, v in list(inputs.items()):
             if torch.is_tensor(v):
-                # Keep audio features as float32 unless you *know* the model supports fp16 here.
                 if k == "input_features":
                     inputs[k] = v.to(device=device, dtype=torch.float32)
                 else:
                     inputs[k] = v.to(device)
 
+    # Run generation (audio output is model/version dependent).
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=int(cfg.qwen.max_new_tokens))
+        gen_kwargs = {
+            "max_new_tokens": int(cfg.qwen.max_new_tokens),
+            # These flags are used in HF docs/examples for Qwen3-Omni.
+            # If unsupported by the installed transformers version, we fall back.
+            "thinker_do_sample": False,
+            "talker_do_sample": True,
+            "return_dict_in_generate": True,
+        }
+        if bool(getattr(cfg.qwen, "return_audio", True)):
+            gen_kwargs["return_audio"] = True
 
-    # Decode only newly generated tokens when possible.
+        # Best-effort compatibility ladder
+        try:
+            gen_out = model.generate(**inputs, **gen_kwargs)
+        except TypeError:
+            gen_kwargs.pop("return_audio", None)
+            try:
+                gen_out = model.generate(**inputs, **gen_kwargs)
+            except TypeError:
+                gen_kwargs.pop("thinker_do_sample", None)
+                gen_kwargs.pop("talker_do_sample", None)
+                try:
+                    gen_out = model.generate(**inputs, **gen_kwargs)
+                except TypeError:
+                    gen_kwargs.pop("return_dict_in_generate", None)
+                    gen_out = model.generate(**inputs, **gen_kwargs)
+
+    seq, audio = _extract_sequences_and_audio(gen_out)
+
+    # Decode tokens (new tokens only when possible).
+    gen_tokens = seq
     try:
         input_len = inputs["input_ids"].shape[1]
-        gen = out[:, input_len:]
-        if gen.numel() == 0:
-            gen = out
+        if hasattr(seq, "__getitem__"):
+            sliced = seq[:, input_len:]
+            if getattr(sliced, "numel", lambda: 0)() != 0:
+                gen_tokens = sliced
     except Exception:
-        gen = out
+        pass
 
-    return processor.batch_decode(gen, skip_special_tokens=True)[0]
+    text_out = processor.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+
+    wav_np = None
+    sr = None
+    if audio is not None:
+        # Some pipelines return waveform directly, others return RVQ codec codes.
+        decoded_wav, did_decode = _maybe_decode_codec_to_wav(cfg, model, audio)
+        if did_decode:
+            wav_np = _wav_to_numpy_f32(decoded_wav)
+            sr = int(getattr(cfg.qwen, "talker_sample_rate", 24000))
+        else:
+            wav_np = _wav_to_numpy_f32(audio)
+            sr = int(getattr(cfg.qwen, "talker_sample_rate", 24000)) if wav_np is not None else None
+
+    return {"text": text_out, "wav_f32": wav_np, "sr": sr}
+
+
+def infer_audio_input_once(cfg: AppConfig, audio_in: AudioInput, user_text: str) -> str:
+    """Backward-compatible helper: returns text only."""
+    return infer_audio_input_once_result(cfg, audio_in, user_text).get("text", "")
 
 
 def infer_pcm16le_once(

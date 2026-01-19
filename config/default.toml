@@ -9,7 +9,9 @@ frame_hz = 12.5
 frames_per_chunk = 4
 
 [qwen]
-# Backend: "transformers" (local HF inference)
+# Backend:
+# - "transformers": local HF inference (end-to-end generate).
+# - "team": call sca_run/team_infer.py (plug in teammate pipeline).
 backend = "transformers"
 
 # Hugging Face model id or local path
@@ -27,6 +29,13 @@ attn_implementation = "flash_attention_2"
 
 # Generation length for each request
 max_new_tokens = 256
+
+# Ask the backend to return audio (if supported).
+return_audio = true
+
+# Sample rate of talker speech output.
+# HF docs/examples use 24000 for Qwen3-Omni generated speech.
+talker_sample_rate = 24000
 
 # Optional system prompt
 system_prompt = "You are a helpful assistant."

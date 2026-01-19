@@ -16,7 +16,9 @@
   <h3>sca_run</h3>
   <div>
     <button id="micBtn">Mic ON</button>
+    <button id="muteBtn" disabled>Mic Mute</button>
     <button id="runBtn" disabled>Start Qwen</button>
+    <button id="spkBtn" disabled>Speaker OFF</button>
   </div>
   <div id="status" class="small">Idle.</div>
   <div id="log" class="small"></div>
@@ -24,7 +26,9 @@
 <script>
 (() => {
   const micBtn = document.getElementById('micBtn');
+  const muteBtn = document.getElementById('muteBtn');
   const runBtn = document.getElementById('runBtn');
+  const spkBtn = document.getElementById('spkBtn');
   const statusEl = document.getElementById('status');
   const logEl = document.getElementById('log');
 
@@ -37,6 +41,12 @@
   let ws = null;
   let sending = false;
   let micOn = false;
+  let micMuted = false;
+
+  let speakerOn = false;
+  let playCtx = null;
+  let nextPlayTime = 0;
+  let pendingAudioMeta = null;
 
   // Server expects 16kHz mono PCM16LE by default (see config/default.toml)
   const TARGET_SR = 16000;
@@ -111,7 +121,12 @@
       const pcm16 = floatTo16BitPCM(mono16k);
 
       if (sending && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(pcm16.buffer);
+        if (micMuted) {
+          // Keep timing stable: send zeros with the same frame size.
+          ws.send(new Int16Array(pcm16.length).buffer);
+        } else {
+          ws.send(pcm16.buffer);
+        }
       }
     };
 
@@ -121,12 +136,16 @@
 
     micOn = true;
     runBtn.disabled = false;
+    muteBtn.disabled = false;
     micBtn.textContent = 'Mic OFF';
     setStatus(`Mic ON. Browser SR=${audioCtx.sampleRate} -> sending ${TARGET_SR}Hz mono PCM16 when Qwen starts.`);
   }
 
   async function stopMic() {
     if (!micOn) return;
+
+    // If we're streaming, stop Qwen first.
+    if (sending) stopQwen();
 
     try { processorNode && processorNode.disconnect(); } catch (e) {}
     try { sourceNode && sourceNode.disconnect(); } catch (e) {}
@@ -149,6 +168,9 @@
     micOn = false;
     micBtn.textContent = 'Mic ON';
     runBtn.disabled = true;
+    muteBtn.disabled = true;
+    micMuted = false;
+    muteBtn.textContent = 'Mic Mute';
     setStatus('Mic OFF.');
   }
 
@@ -170,34 +192,60 @@
     ws.onopen = () => {
       sending = true;
       runBtn.textContent = 'Stop Qwen';
+      spkBtn.disabled = false;
       setStatus('Streaming audio to server... (server will chunk into 4 frames per request)');
       log('WS connected: ' + wsUrl());
     };
 
-    ws.onmessage = (ev) => {
-      // Server replies JSON per processed chunk.
-      try {
-        const obj = JSON.parse(ev.data);
-        if (obj && typeof obj === 'object') {
-          if (obj.error) {
-            log('ERROR: ' + obj.error);
-          } else {
-            // Keep it minimal: show chunk counter and optional text preview
-            let line = `chunk #${obj.chunks ?? '?'} processed`;
-            if (obj.text_preview) line += ` | text: ${obj.text_preview}`;
-            log(line);
+    ws.onmessage = async (ev) => {
+      // Text frames: JSON events. Binary frames: talker audio bytes.
+      if (typeof ev.data === 'string') {
+        try {
+          const obj = JSON.parse(ev.data);
+          if (obj && typeof obj === 'object') {
+            if (obj.type === 'talker_audio') {
+              pendingAudioMeta = obj;
+              return;
+            }
+            if (obj.type === 'talker_text') {
+              if (obj.text) log('TALKER: ' + obj.text);
+              return;
+            }
+            if (obj.type === 'chunk_result') {
+              let line = `chunk #${obj.chunks ?? '?'} processed`;
+              if (obj.text_preview) line += ` | text: ${obj.text_preview}`;
+              log(line);
+              return;
+            }
+            if (obj.type === 'error' || obj.error) {
+              log('ERROR: ' + (obj.error || 'unknown'));
+              return;
+            }
           }
-        } else {
+          log(String(ev.data));
+        } catch {
           log(String(ev.data));
         }
-      } catch {
-        log(String(ev.data));
+        return;
       }
+
+      // Binary audio
+      if (!speakerOn) return;
+      if (!pendingAudioMeta) return;
+      const sr = pendingAudioMeta.sr || 24000;
+      const ch = pendingAudioMeta.channels || 1;
+      const fmt = pendingAudioMeta.fmt || 'pcm16le';
+      pendingAudioMeta = null;
+      if (fmt !== 'pcm16le') return;
+
+      const buf = (ev.data instanceof ArrayBuffer) ? ev.data : await ev.data.arrayBuffer();
+      playPcm16le(buf, sr, ch);
     };
 
     ws.onclose = () => {
       sending = false;
       runBtn.textContent = 'Start Qwen';
+      spkBtn.disabled = true;
       setStatus(micOn ? 'Mic ON. Qwen stopped.' : 'Idle.');
       log('WS closed.');
     };
@@ -213,6 +261,48 @@
     ws = null;
     sending = false;
     runBtn.textContent = 'Start Qwen';
+    spkBtn.disabled = true;
+  }
+
+  function ensurePlayCtx() {
+    if (!playCtx) {
+      playCtx = new (window.AudioContext || window.webkitAudioContext)();
+      nextPlayTime = playCtx.currentTime;
+    }
+  }
+
+  function playPcm16le(arrayBuffer, sampleRate, channels) {
+    ensurePlayCtx();
+    if (playCtx.state === 'suspended') {
+      // Resume requires user gesture; caller is triggered by WS (not a gesture),
+      // so we rely on the Speaker button click to resume.
+      return;
+    }
+
+    const i16 = new Int16Array(arrayBuffer);
+    if (i16.length === 0) return;
+
+    const frameCount = Math.floor(i16.length / channels);
+    const audioBuffer = playCtx.createBuffer(channels, frameCount, sampleRate);
+
+    for (let c = 0; c < channels; c++) {
+      const chData = audioBuffer.getChannelData(c);
+      let idx = c;
+      for (let i = 0; i < frameCount; i++) {
+        chData[i] = i16[idx] / 32768.0;
+        idx += channels;
+      }
+    }
+
+    const src = playCtx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(playCtx.destination);
+
+    // Simple jitter buffer: schedule sequential playback.
+    const now = playCtx.currentTime;
+    if (nextPlayTime < now + 0.02) nextPlayTime = now + 0.02;
+    src.start(nextPlayTime);
+    nextPlayTime += audioBuffer.duration;
   }
 
   micBtn.addEventListener('click', async () => {
@@ -228,6 +318,26 @@
   runBtn.addEventListener('click', () => {
     if (!sending) startQwen();
     else stopQwen();
+  });
+
+  muteBtn.addEventListener('click', () => {
+    micMuted = !micMuted;
+    muteBtn.textContent = micMuted ? 'Mic Unmute' : 'Mic Mute';
+    if (micOn) {
+      setStatus(micMuted ? 'Mic ON (muted).' : 'Mic ON.');
+    }
+  });
+
+  spkBtn.addEventListener('click', async () => {
+    speakerOn = !speakerOn;
+    spkBtn.textContent = speakerOn ? 'Speaker ON' : 'Speaker OFF';
+    if (speakerOn) {
+      ensurePlayCtx();
+      try { await playCtx.resume(); } catch (e) {}
+      log('Speaker enabled.');
+    } else {
+      log('Speaker disabled.');
+    }
   });
 })();
 </script>

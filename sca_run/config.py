@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 
@@ -62,7 +62,10 @@ class QwenConfig:
     (used inside qwen-omni-utils).
     """
 
-    backend: str = "transformers"  # only supported value in this scaffold
+    # Backend selector.
+    # - "transformers": use HF Transformers Qwen3-Omni end-to-end generation.
+    # - "team": call sca_run.team_infer (your teammate's pipeline).
+    backend: str = "transformers"
 
     # Hugging Face model id or local directory
     model_id: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -75,14 +78,22 @@ class QwenConfig:
     # Generation length per request
     max_new_tokens: int = 256
 
+    # Whether to request audio output during generation (if supported).
+    return_audio: bool = True
+
+    # Talker audio sample rate. HF docs/examples use 24kHz for generated speech.
+    talker_sample_rate: int = 24000
+
     # Optional: attach a constant system prompt for the thinker
     system_prompt: str = "You are a helpful assistant."
 
 
 @dataclass
 class AppConfig:
-    audio: AudioConfig = AudioConfig()
-    qwen: QwenConfig = QwenConfig()
+    # NOTE: dataclass fields must not use mutable instances as defaults.
+    # Use default_factory so each AppConfig gets its own config objects.
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    qwen: QwenConfig = field(default_factory=QwenConfig)
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -126,6 +137,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         )
         or None,
         max_new_tokens=int(_env("SCA_QWEN_MAX_NEW_TOKENS", qwen_t.get("max_new_tokens", 256))),
+        return_audio=str(_env("SCA_QWEN_RETURN_AUDIO", qwen_t.get("return_audio", True))).lower() not in ("0", "false", "no"),
+        talker_sample_rate=int(_env("SCA_QWEN_TALKER_SR", qwen_t.get("talker_sample_rate", 24000))),
         system_prompt=str(
             _env(
                 "SCA_QWEN_SYSTEM_PROMPT",
