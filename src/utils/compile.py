@@ -26,7 +26,8 @@ def torch_compile_lazy(fun):
         if _compile_disabled: return fun(*args, **kwargs)
         if fun_compiled is None:
             # Latency 최적화 모드 사용
-            fun_compiled = torch.compile(fun, mode="reduce-overhead")
+            #fun_compiled = torch.compile(fun, mode="reduce-overhead")
+            fun_compiled = torch.compile(fun, mode="default")
         return fun_compiled(*args, **kwargs)
     return _wrapped
 
