@@ -237,8 +237,13 @@ class Qwen3DuplexLogic:
     @torch.no_grad()
     def decode_audio(self, audio_codes: torch.Tensor) -> np.ndarray:
         target_device = self.code2wav_device
-        if audio_codes.device != target_device: audio_codes = audio_codes.to(target_device)
-        if audio_codes.dim() == 2: audio_codes = audio_codes.unsqueeze(-1)
+        if audio_codes.device != target_device:
+            audio_codes = audio_codes.to(target_device)
+        if audio_codes.dim() == 2: 
+            audio_codes = audio_codes.unsqueeze(-1)
+            
+        if not audio_codes.is_contiguous():
+            audio_codes = audio_codes.contiguous()
             
         # ★ 컴파일된 함수 호출 (첫 실행 시 컴파일 오버헤드 있음)
         wav_tensor = self.decode_audio_compiled(audio_codes)
