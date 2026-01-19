@@ -88,99 +88,82 @@ class Qwen3DuplexLogic:
         return int(total_output_lengths)
 
     @torch.no_grad()
-    def thinker_step(self, input_ids, input_features, feature_attention_mask, past_key_values, step_idx):
-        # [Safety] Device Move
+    def thinker_step(self, input_ids, input_features, feature_attention_mask, past_key_values, step_idx=None):
+        """
+        Thinker Step: Audio or Text Input -> Next Token Prediction
+        """
+        # ★ [FIX] 초기화: inputs_embeds 변수가 모든 분기에서 정의되도록 함
         target_device = self.thinker_device
+        inputs_embeds = None
         
-        if input_ids is not None and input_ids.device != target_device:
-            input_ids = input_ids.to(target_device)
-        
-        # =========================================================================
-        # ★ [최종 수정] Audio Input 처리 (공식 아키텍처 준수)
-        # =========================================================================
-        if input_features is not None:
-            if input_features.device != self.thinker_device:
-                input_features = input_features.to(self.thinker_device)
-            input_features = input_features.to(dtype=self.audio_dtype)
+        try:
+            # 1. Audio Input Case
+            if input_features is not None:
+                if input_features.device != target_device:
+                    input_features = input_features.to(target_device)
+                input_features = input_features.to(dtype=self.audio_dtype)
 
-            # [수정 포인트 A] 마스크가 없으면 강제로 생성 (NoneType Error 방지)
-            if feature_attention_mask is None:
-                # shape: [Batch, Mel, Time]
-                batch_size = input_features.shape[0]
-                time_dim = input_features.shape[2]
-                feature_attention_mask = torch.ones(
-                    (batch_size, time_dim), 
+                # Mask 생성 (NoneType 방지)
+                if feature_attention_mask is None:
+                    batch_size = input_features.shape[0]
+                    time_dim = input_features.shape[2] 
+                    feature_attention_mask = torch.ones(
+                        (batch_size, time_dim), 
+                        dtype=torch.long, 
+                        device=target_device
+                    )
+                else:
+                    if feature_attention_mask.device != target_device:
+                        feature_attention_mask = feature_attention_mask.to(target_device)
+
+                # 실제 임베딩 추출
+                actual_audio_embeds = self.model.thinker.get_audio_features(
+                    input_features,
+                    feature_attention_mask=feature_attention_mask
+                )
+                
+                # input_ids 생성
+                actual_token_count = actual_audio_embeds.shape[1]
+                audio_token_id = self.model.config.thinker_config.audio_token_id
+                
+                input_ids = torch.full(
+                    (1, actual_token_count), 
+                    audio_token_id, 
                     dtype=torch.long, 
                     device=target_device
                 )
+                
+                inputs_embeds = actual_audio_embeds
+
+            # 2. Text Input Case
+            elif input_ids is not None:
+                if input_ids.device != target_device:
+                    input_ids = input_ids.to(target_device)
+                # Text 모드에서는 inputs_embeds는 None 상태 유지 (모델 내부에서 생성)
+                pass 
+                
             else:
-                if feature_attention_mask.device != target_device:
-                    feature_attention_mask = feature_attention_mask.to(target_device)
+                raise ValueError("ThinkerStep: input_ids and input_features are both None")
 
-            # [수정 포인트 B] _calc 함수 대신 실제 모델을 돌려서 정확한 임베딩과 길이를 얻음
-            # 이 함수가 Mel Spectrogram -> Audio Embedding 변환을 수행함
-            # 이때 마스크도 같이 넣어줘야 에러가 안 남
-            audio_seq_len = feature_attention_mask.sum(dim=1)
-            actual_audio_embeds = self.model.thinker.get_audio_features(
-                input_features=input_features,
-                feature_attention_mask=feature_attention_mask,
-                audio_feature_lengths=audio_seq_len
+            # 3. Forward
+            # ★ [FIX] inputs_embeds가 None이어도 에러 안 나게 처리됨 (모델 내부 로직)
+            outputs = self.model.thinker(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds, 
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True
             )
             
-            # [수정 포인트 C] 실제 나온 임베딩 길이만큼 input_ids 생성 (Tensor Mismatch 해결)
-            actual_token_count = actual_audio_embeds.shape[1]
-            audio_token_id = self.model.config.thinker_config.audio_token_id
+            consumed_len = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+            return outputs, consumed_len
 
-
-            input_ids = torch.full(
-                (1, actual_token_count), 
-                audio_token_id, 
-                dtype=torch.long, 
-                device=target_device
-            )
-            # 5. Transpose 하지 않음! (Qwen AudioEncoder 내부에서 처리함)
-            inputs_embeds = actual_audio_embeds
-        elif input_ids is not None:
-            # 텍스트 입력인 경우
-            pass
-        else:
-            # 예외 처리
-            input_ids = torch.tensor([[0]], device=self.thinker_device)
-
-        # =========================================================================
-        
-        seq_len = input_ids.shape[1]
-        
-        # 1. Config에서 최대 길이 가져오기 (없으면 1500 기본값)
-        # 오디오 인코더의 한계(1500)가 전체 문맥 길이보다 타이트하므로 이를 기준으로 잡음
-        max_pos_limit = getattr(self.model.config.thinker_config.audio_config, "max_source_positions", 1500)
-        
-        # 2. Cycling 로직 적용 (안전 구간: max_pos_limit의 50% 지점부터 순환)
-        # 예: 1500이면 750 ~ 1500 사이를 뱅글뱅글 돎
-        cycle_start = max_pos_limit // 2  # 750
-        cycle_len = max_pos_limit - cycle_start # 750
-        
-        if step_idx >= max_pos_limit:
-            safe_start_idx = cycle_start + (step_idx - cycle_start) % cycle_len
-        else:
-            safe_start_idx = step_idx
-            
-        current_pos_ids = torch.arange(safe_start_idx, safe_start_idx + seq_len, device=target_device)
-        current_pos_ids = current_pos_ids.clamp(0, max_pos_limit - 1)
-        position_ids = current_pos_ids.unsqueeze(0).expand(3, -1, -1)
-
-
-        outputs = self.model.thinker(
-            input_ids=input_ids,           # 위치 계산용 Placeholder
-            inputs_embeds=inputs_embeds,   # ★ 실제 오디오 값 (이게 없으면 내부에서 또 계산하려다 에러 남)
-            feature_attention_mask=feature_attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,     # 수동 계산한 ID 전달
-            use_cache=True,
-            output_hidden_states=True
-        )
-        # 길이를 같이 반환하여 step_count를 정확히 업데이트
-        return outputs, seq_len
+        except Exception as e:
+            log("error", f"🚨 Error in thinker_step: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e # 에러를 상위로 던져서 멈추게 함 (디버깅용)
 
     # @torch.no_grad()
     # def talker_step(self, thinker_hidden, past_key_values, step_idx, input_ids=None):
